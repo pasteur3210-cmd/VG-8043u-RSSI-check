@@ -52,7 +52,9 @@ class App:
             try:
                 summary,base=run_test(v['DUT IP'],v['Login'],v['Password'],v['SN / DUT ID'],v['Operator'],int(v['RSSI 門檻']),float(v['擷取秒數']),self.output,int(v['Telnet Port']),self.write)
                 status=summary['result']
-                self.write('Result: '+status+' | Min RSSI: '+str(summary['min_rssi']))
+                self.write('DUT SN: '+str(summary['device_sn'])+' | SN Check: '+summary['sn_result'])
+                self.write('RSSI Check: '+summary['rssi_result']+' | Min RSSI: '+str(summary['min_rssi']))
+                self.write('Overall Result: '+status)
                 self.write('Reason: '+summary['reason'])
                 self.write('Evidence: '+str(base)+'.log')
                 self.root.after(0,lambda:self.status.set(status))

@@ -7,7 +7,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = '1.0.0'
+VERSION = '1.0.2'
 # Report explicit RSSI and parenthesized multi-chain readings preceding FA/CCA.
 EXPLICIT = re.compile(r'\bRSSI\s*[:= ]\s*\(?\s*(-?\d{1,3})\b', re.I)
 CHAINS = re.compile(r'\(\s*((?:-?\d{1,3}\s+){1,15}-?\d{1,3})\s*\)\s*\(\s*(?:FA|CCA)\b', re.I)
@@ -29,6 +29,23 @@ def extract_rssi(raw):
     return results
 
 
+SERIAL_LINE = re.compile(r'(?im)^\s*Serial\s+Number\s*:\s*([A-Za-z0-9][A-Za-z0-9_-]{2,79})\s*$')
+
+
+def extract_serial_number(raw):
+    """Extract device SN only from an explicit 'Serial Number:' response."""
+    matches = SERIAL_LINE.findall(raw.replace('\r', ''))
+    return matches[-1].strip() if matches else None
+
+
+def judge_serial(expected, actual):
+    if not actual:
+        return 'REVIEW', '設備未回傳有效 Serial Number'
+    if actual.strip().upper() != expected.strip().upper():
+        return 'FAIL', f'SN 不一致：輸入={expected}，DUT={actual}'
+    return 'PASS', 'DUT SN 與輸入 SN 相同'
+
+
 def judge(samples, limit=50):
     if not samples:
         return 'REVIEW', None, '未擷取到可辨識 RSSI 資料'
@@ -46,6 +63,7 @@ class Telnet:
         self.raw = bytearray()
         self._state = 0
         self._verb = 0
+        self._closed = False
 
     def _filter_telnet(self, data):
         out = bytearray()
@@ -76,7 +94,9 @@ class Telnet:
         while time.monotonic() < end:
             try:
                 packet = self.sock.recv(8192)
-                if not packet: break
+                if not packet:
+                    self._closed = True
+                    break
                 decoded = self._filter_telnet(packet)
                 out.extend(decoded)
                 self.raw.extend(decoded)
@@ -102,6 +122,9 @@ def run_test(host, user, password, serial, operator, threshold=50, duration=6, o
     base = dest / (now.strftime('%Y%m%d_%H%M%S_%f') + '_' + key)
     transcript = ''
     err = ''
+    device_sn = None
+    sn_status = 'REVIEW'
+    sn_reason = '尚未完成 SN 檢查'
     events = []
     conn = None
     def step(msg):
@@ -110,18 +133,36 @@ def run_test(host, user, password, serial, operator, threshold=50, duration=6, o
     try:
         step(f'Connect {host}:{port}')
         conn = Telnet(host, int(port))
-        initial = conn.read(8, lambda s: re.search(r'(?:login|username)\s*:', s, re.I) is not None)
-        if not re.search(r'(?:login|username)\s*:', initial, re.I):
-            raise RuntimeError('未收到 Login/Username 提示')
+        # Some embedded Telnet servers display "login:" only after a CR/CRLF.
+        # Preserve all pre-auth bytes even on failure (V1.0.0 had no evidence).
+        login_rx = re.compile(r'(?:login|username|user name)\s*[:：]\s*$', re.I)
+        initial = conn.read(3, lambda s: login_rx.search(s.strip(' \r\n\x00')) is not None)
+        step(f'Initial RX {len(initial)} chars; hex={initial.encode("latin1", "replace")[:96].hex(" ")}')
+        if not login_rx.search(initial.strip(' \r\n\x00')):
+            if conn._closed:
+                raise RuntimeError('Telnet 伺服器在登入前關閉連線')
+            step('No login prompt; send CR to wake up server')
+            conn.send('')
+            initial += conn.read(5, lambda s: login_rx.search(s.strip(' \r\n\x00')) is not None)
+        if not login_rx.search(initial.strip(' \r\n\x00')):
+            raise RuntimeError('未收到 Login/Username 提示；請查看 LOG 中的 Pre-login Telnet RX 與 negotiation')
         conn.send(user)
-        prompt = conn.read(8, lambda s: re.search(r'password\s*:', s, re.I) is not None)
-        if not re.search(r'password\s*:', prompt, re.I):
+        prompt = conn.read(8, lambda s: re.search(r'password\s*[:：]', s, re.I) is not None)
+        if not re.search(r'password\s*[:：]', prompt, re.I):
             raise RuntimeError('未收到 Password 提示')
         conn.send(password)
         ready = conn.read(8, lambda s: bool(PROMPT.search(s)) or 'incorrect' in s.lower() or 'failed' in s.lower())
         if not PROMPT.search(ready) or re.search(r'login incorrect|authentication failed|login failed', ready, re.I):
             raise RuntimeError('登入失敗或未取得命令提示符')
         step('Login OK')
+        # Read-only command at the user prompt, before entering debug/shell mode.
+        step('Send serialnumber')
+        conn.send('serialnumber')
+        serial_rx = conn.read(5, lambda x: bool(PROMPT.search(x)) and ('Serial Number:' in x or 'not found' in x.lower()))
+        device_sn = extract_serial_number(serial_rx)
+        sn_status, sn_reason = judge_serial(serial, device_sn)
+        step(f'Serial Number check: {sn_status}; device={device_sn or "N/A"}')
+        # A missing SN is not a PASS; retain the full RSSI test evidence nevertheless.
         # Exactly follow provided command order. First command may enter debug mode.
         for cmd in ('version --debug x4Wnhq2ReL', 'sh'):
             step(f'Send {cmd.split()[0]}')
@@ -154,18 +195,22 @@ def run_test(host, user, password, serial, operator, threshold=50, duration=6, o
     relevant = transcript[anchor:] if anchor != -1 else transcript
     samples = extract_rssi(relevant)
     status, minimum, reason = judge(samples, int(threshold))
+    rssi_status = status
     if err: status, reason = 'ERROR', err
+    elif sn_status == 'FAIL': status, reason = 'FAIL', sn_reason
+    elif status == 'FAIL': pass
+    elif sn_status != 'PASS': status, reason = 'REVIEW', sn_reason
     elif not samples: status = 'REVIEW'
     summary = dict(timestamp=now.isoformat(timespec='seconds'), model='VG-8043u', sn=serial, operator=operator,
                    host=host, port=int(port), threshold=int(threshold), capture_seconds=float(duration),
-                   result=status, min_rssi=minimum, reason=reason, samples=samples, events=events,
+                   result=status, rssi_result=rssi_status, sn_result=sn_status, device_sn=device_sn, sn_reason=sn_reason, min_rssi=minimum, reason=reason, samples=samples, events=events,
                    raw_log=base.name + '.log')
-    (base.with_suffix('.log')).write_text(transcript + '\n\n' + '\n'.join(events), encoding='utf-8')
+    (base.with_suffix('.log')).write_text('=== Telnet RX (redacted) ===\n' + transcript + '\n\n=== Events ===\n' + '\n'.join(events), encoding='utf-8')
     (base.with_suffix('.json')).write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding='utf-8')
     ledger = dest / 'RSSI_Test_Results.csv'
     new = not ledger.exists()
     with ledger.open('a', newline='', encoding='utf-8-sig') as f:
         writer = csv.writer(f)
-        if new: writer.writerow(['Time','Model','SN','Operator','IP','RSSI Min','Threshold','Result','Reason','Raw Log','JSON'])
-        writer.writerow([summary['timestamp'],summary['model'],serial,operator,host,minimum,threshold,status,reason,base.name+'.log',base.name+'.json'])
+        if new: writer.writerow(['Time','Model','Expected SN','DUT SN','SN Check','Operator','IP','RSSI Min','Threshold','RSSI Check','Overall Result','Reason','Raw Log','JSON'])
+        writer.writerow([summary['timestamp'],summary['model'],serial,device_sn or '',sn_status,operator,host,minimum,threshold,rssi_status,status,reason,base.name+'.log',base.name+'.json'])
     return summary, base
