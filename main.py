@@ -57,6 +57,9 @@ class App:
                 self.write('Overall Result: '+status)
                 self.write('Reason: '+summary['reason'])
                 self.write('Evidence: '+str(base)+'.log')
+                self.write('Debug: '+str(base)+'.debug.log')
+                self.write('Failure phase: '+str(summary.get('failure_phase','')))
+                self.write('Build version: '+VERSION)
                 self.root.after(0,lambda:self.status.set(status))
             except Exception as exc:
                 self.write('Program error: '+str(exc));self.root.after(0,lambda:self.status.set('ERROR'))

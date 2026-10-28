@@ -3,11 +3,15 @@ import csv
 import json
 import re
 import socket
+import sys
+import platform
+import hashlib
+import traceback
 import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = '1.0.3'
+VERSION = '1.0.4'
 # Report explicit RSSI and parenthesized multi-chain readings preceding FA/CCA.
 EXPLICIT = re.compile(r'\bRSSI\s*[:= ]\s*\(?\s*(-?\d{1,3})\b', re.I)
 CHAINS = re.compile(r'\(\s*((?:-?\d{1,3}\s+){1,15}-?\d{1,3})\s*\)\s*\(\s*(?:FA|CCA)\b', re.I)
@@ -56,10 +60,51 @@ def judge(samples, limit=50):
     return ('PASS' if lo >= limit else 'FAIL'), lo, ('全部讀值達標' if lo >= limit else '至少一筆低於門檻')
 
 
+class ConnectFailure(OSError):
+    def __init__(self, stage, message, code=None):
+        super().__init__(message)
+        self.stage = stage
+        self.code = code
+
+
+def connect_tcp(host, port, timeout=8, report=None):
+    """Trace DNS, TCP connect, source endpoint and elapsed time separately.
+
+    Never mistake a TCP connect timeout for a Telnet login timeout.
+    """
+    report = report or (lambda _msg: None)
+    t0 = time.monotonic()
+    report(f'TCP_RESOLVE_BEGIN host={host} port={port}')
+    try:
+        targets = socket.getaddrinfo(host, int(port), type=socket.SOCK_STREAM)
+    except OSError as e:
+        report(f'TCP_RESOLVE_FAIL errno={getattr(e, "errno", None)} winerror={getattr(e, "winerror", None)}')
+        raise ConnectFailure('TCP_RESOLVE', str(e), getattr(e, 'winerror', None)) from e
+    last = None
+    for af, kind, proto, _canon, addr in targets:
+        sock = socket.socket(af, kind, proto)
+        try:
+            sock.settimeout(float(timeout))
+            report(f'TCP_CONNECT_BEGIN target={addr[0]}:{addr[1]} timeout={timeout}s')
+            # A real connect() is a separate stage, not an authentication failure.
+            sock.connect(addr)
+            elapsed = time.monotonic()-t0
+            report(f'TCP_CONNECTED local={sock.getsockname()} remote={sock.getpeername()} elapsed={elapsed:.3f}s')
+            sock.settimeout(0.25)
+            return sock
+        except OSError as e:
+            last = e
+            report(f'TCP_CONNECT_FAIL target={addr[0]}:{addr[1]} elapsed={time.monotonic()-t0:.3f}s '
+                   f'exception={type(e).__name__} errno={getattr(e,"errno",None)} '
+                   f'winerror={getattr(e,"winerror",None)} detail={str(e)}')
+            sock.close()
+    raise ConnectFailure('TCP_CONNECT', f'TCP 連線失敗: {last}',
+                         getattr(last, 'winerror', None) or getattr(last, 'errno', None))
+
+
 class Telnet:
-    def __init__(self, host, port=23, timeout=8):
-        self.sock = socket.create_connection((host, port), timeout=timeout)
-        self.sock.settimeout(0.25)
+    def __init__(self, host, port=23, timeout=8, report=None):
+        self.sock = connect_tcp(host, port, timeout=timeout, report=report)
         self.raw = bytearray()
         self._state = 0
         self._verb = 0
@@ -166,12 +211,18 @@ def run_test(host, user, password, serial, operator, threshold=50, duration=6, o
     sn_reason = '尚未完成 SN 檢查'
     events = []
     conn = None
+    phase = 'INIT'
+    error_code = ''
+    diagnostic_steps = []
     def step(msg):
         events.append(f'{datetime.now().astimezone().isoformat(timespec="seconds")} {msg}')
         if log: log(msg)
     try:
+        step(f'TEST_BEGIN version={VERSION} python={sys.version.split()[0]} OS={platform.platform()}')
         step(f'Connect {host}:{port}')
-        conn = Telnet(host, int(port))
+        phase='TCP_CONNECT'
+        conn = Telnet(host, int(port), report=step)
+        phase='LOGIN_PROMPT'
         # Some embedded Telnet servers display "login:" only after a CR/CRLF.
         # Preserve all pre-auth bytes even on failure (V1.0.0 had no evidence).
         login_rx = re.compile(r'(?:login|username|user name)\s*[:：]\s*$', re.I)
@@ -190,15 +241,18 @@ def run_test(host, user, password, serial, operator, threshold=50, duration=6, o
         if not login_rx.search(initial.strip(' \r\n\x00')):
             raise RuntimeError('未收到 Login/Username 提示；請查看 LOG 中的 Pre-login Telnet RX 與 negotiation')
         conn.in_login = False
+        phase='PASSWORD_PROMPT'
         conn.send(user)
         prompt = conn.read(8, lambda s: re.search(r'password\s*[:：]', s, re.I) is not None)
         if not re.search(r'password\s*[:：]', prompt, re.I):
             raise RuntimeError('未收到 Password 提示')
+        phase='AUTHENTICATION'
         conn.send(password)
         ready = conn.read(8, lambda s: bool(PROMPT.search(s)) or 'incorrect' in s.lower() or 'failed' in s.lower())
         if not PROMPT.search(ready) or re.search(r'login incorrect|authentication failed|login failed', ready, re.I):
             raise RuntimeError('登入失敗或未取得命令提示符')
         step('Login OK')
+        phase='SERIAL'
         # Read-only command at the user prompt, before entering debug/shell mode.
         step('Send serialnumber')
         conn.send('serialnumber')
@@ -208,12 +262,14 @@ def run_test(host, user, password, serial, operator, threshold=50, duration=6, o
         step(f'Serial Number check: {sn_status}; device={device_sn or "N/A"}')
         # A missing SN is not a PASS; retain the full RSSI test evidence nevertheless.
         # Exactly follow provided command order. First command may enter debug mode.
+        phase='DEBUG_SHELL'
         for cmd in ('version --debug x4Wnhq2ReL', 'sh'):
             step(f'Send {cmd.split()[0]}')
             conn.send(cmd)
             response = conn.read(4, lambda s: bool(PROMPT.search(s)))
             if not PROMPT.search(response):
                 raise RuntimeError(f'{cmd.split()[0]} 後未取得命令提示符')
+        phase='RSSI'
         step('Send rssimlo 2')
         conn.send('rssimlo 2')
         conn.read(3)
@@ -226,13 +282,16 @@ def run_test(host, user, password, serial, operator, threshold=50, duration=6, o
         conn.sock.sendall(b'\x03')  # Ctrl-C
         conn.read(1.5)
         transcript = conn.raw.decode('latin1', 'replace')
-    except (OSError, RuntimeError, ValueError) as e:
-        err = str(e); step('ERROR ' + err)
+    except Exception as e:
+        error_code = (e.stage if isinstance(e, ConnectFailure) else phase)
+        err = str(e); step(f'ERROR phase={phase} code={error_code} type={type(e).__name__} detail={err}')
+        diagnostic_steps.append(traceback.format_exc())
         if conn: transcript = conn.raw.decode('latin1', 'replace')
     finally:
         if conn:
             step(f'Wire RX bytes={len(conn.wire_rx)}, negotiation={len(conn.negotiation)}')
-            conn.close()
+            try: conn.close()
+            except OSError: pass
     # Keep the password out of saved logs even if remote echoes credentials.
     for secret in (password, 'x4Wnhq2ReL'):
         if secret: transcript = transcript.replace(secret, '[REDACTED]')
@@ -250,13 +309,22 @@ def run_test(host, user, password, serial, operator, threshold=50, duration=6, o
     summary = dict(timestamp=now.isoformat(timespec='seconds'), model='VG-8043u', sn=serial, operator=operator,
                    host=host, port=int(port), threshold=int(threshold), capture_seconds=float(duration),
                    result=status, rssi_result=rssi_status, sn_result=sn_status, device_sn=device_sn, sn_reason=sn_reason, min_rssi=minimum, reason=reason, samples=samples, events=events,
-                   raw_log=base.name + '.log')
+                   raw_log=base.name + '.log', version=VERSION, failure_phase=phase if err else '', error_code=error_code)
     diagnostic = ''
     if conn:
         diagnostic = ('\n\n=== Telnet diagnostic ===\n'
                       + 'Raw wire bytes: ' + str(len(conn.wire_rx)) + '\n'
                       + 'Initial raw wire hex (up to 512 bytes): ' + bytes(conn.prelogin_wire[:512]).hex(' ') + '\n'
                       + 'Negotiation: ' + '; '.join(conn.negotiation[:100]) + '\n')
+    def redact(text):
+        for secret in (password, 'x4Wnhq2ReL'):
+            if secret: text = text.replace(secret,'[REDACTED]')
+        return text
+    debug_output = ('Version: '+VERSION+'\n'+'Python: '+sys.version+'\n'+'OS: '+platform.platform()+'\n'
+                    +'Host: '+host+' Port: '+str(port)+'\n'+'Failure phase: '+(phase if err else 'NONE')+'\n'
+                    +'Error code: '+error_code+'\n'+'\n'.join(events)+'\n'+diagnostic+'\n'+'\n'.join(diagnostic_steps))
+    (base.with_suffix('.debug.log')).write_text(redact(debug_output),encoding='utf-8')
+    (base.with_suffix('.execution.log')).write_text(redact('\n'.join(events)),encoding='utf-8')
     (base.with_suffix('.log')).write_text('=== Telnet RX (redacted) ===\n' + transcript + diagnostic + '\n=== Events ===\n' + '\n'.join(events), encoding='utf-8')
     (base.with_suffix('.json')).write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding='utf-8')
     ledger = dest / 'RSSI_Test_Results.csv'
@@ -265,4 +333,5 @@ def run_test(host, user, password, serial, operator, threshold=50, duration=6, o
         writer = csv.writer(f)
         if new: writer.writerow(['Time','Model','Expected SN','DUT SN','SN Check','Operator','IP','RSSI Min','Threshold','RSSI Check','Overall Result','Reason','Raw Log','JSON'])
         writer.writerow([summary['timestamp'],summary['model'],serial,device_sn or '',sn_status,operator,host,minimum,threshold,rssi_status,status,reason,base.name+'.log',base.name+'.json'])
+    (base.with_suffix('.test.log')).write_text(json.dumps({k:v for k,v in summary.items() if k not in ('events','samples')},indent=2,ensure_ascii=False),encoding='utf-8')
     return summary, base
