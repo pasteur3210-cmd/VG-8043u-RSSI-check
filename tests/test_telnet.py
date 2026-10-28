@@ -25,7 +25,7 @@ def fake_device(mode, listener, seen):
                 t = c.recv(1024)
                 if not t: return b''
                 b += t
-            return b.decode('latin1').strip().replace('ÿü\x01ÿþ\x03','')
+            return b.decode('latin1').strip().replace('ÿü\x01ÿþ\x03','').replace('ÿý\x01ÿû\x03','')
         seen.append(line())
         c.sendall(b'Password: ')
         seen.append(line())

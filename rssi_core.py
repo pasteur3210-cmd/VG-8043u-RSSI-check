@@ -7,7 +7,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-VERSION = '1.0.2'
+VERSION = '1.0.3'
 # Report explicit RSSI and parenthesized multi-chain readings preceding FA/CCA.
 EXPLICIT = re.compile(r'\bRSSI\s*[:= ]\s*\(?\s*(-?\d{1,3})\b', re.I)
 CHAINS = re.compile(r'\(\s*((?:-?\d{1,3}\s+){1,15}-?\d{1,3})\s*\)\s*\(\s*(?:FA|CCA)\b', re.I)
@@ -64,27 +64,66 @@ class Telnet:
         self._state = 0
         self._verb = 0
         self._closed = False
+        self.wire_rx = bytearray()
+        self.prelogin_wire = bytearray()
+        self.in_login = True
+        self.negotiation = []
+        self._sb = bytearray()
+        self._sb_opt = None
+
+    def _option(self, verb, opt):
+        # RFC 854/1091. Advertise only terminal services we can actually provide.
+        self.negotiation.append(f'RX IAC {verb} {opt}')
+        if verb == 253:  # DO
+            accept = opt in (3, 24, 31)
+            reply = 251 if accept else 252  # WILL or WONT
+        elif verb == 251:  # WILL
+            reply = 253 if opt in (1, 3) else 254  # DO or DONT
+        elif verb == 254:  # WONT
+            return
+        else:  # DONT
+            return
+        self.sock.sendall(bytes((255, reply, opt)))
+        self.negotiation.append(f'TX IAC {reply} {opt}')
+        if verb == 253 and opt == 31:
+            self.sock.sendall(bytes((255,250,31,0,80,0,24,255,240)))
+            self.negotiation.append('TX NAWS 80x24')
+
+    def negotiate(self):
+        # Some embedded servers don't show a prompt until client initiates Telnet options.
+        for verb,opt in ((251,24),(251,31),(251,3),(253,3),(253,1)):
+            self.sock.sendall(bytes((255,verb,opt)))
+            self.negotiation.append(f'TX IAC {verb} {opt}')
 
     def _filter_telnet(self, data):
         out = bytearray()
+        self.wire_rx.extend(data)
+        if self.in_login: self.prelogin_wire.extend(data)
         for x in data:
             if self._state == 0:
                 if x == 255: self._state = 1
                 else: out.append(x)
             elif self._state == 1:
                 if x == 255: out.append(255); self._state = 0
-                elif x in (251, 252, 253, 254): self._verb = x; self._state = 2
-                elif x == 250: self._state = 3
+                elif x in (251,252,253,254): self._verb = x; self._state = 2
+                elif x == 250: self._state = 3; self._sb.clear(); self._sb_opt = None
                 else: self._state = 0
             elif self._state == 2:
-                # Reject optional Telnet options; avoid protocol negotiation stalls.
-                reply = 254 if self._verb in (253, 254) else 252
-                self.sock.sendall(bytes([255, reply, x]))
+                self._option(self._verb, x)
                 self._state = 0
             elif self._state == 3:
                 if x == 255: self._state = 4
+                elif self._sb_opt is None: self._sb_opt = x
+                else: self._sb.append(x)
             elif self._state == 4:
-                self._state = 0 if x == 240 else 3
+                if x == 240:
+                    if self._sb_opt == 24 and self._sb[:1] == b'\x01':
+                        self.sock.sendall(b'\xff\xfa\x18\x00VT100\xff\xf0')
+                        self.negotiation.append('TX TTYPE VT100')
+                    self._state = 0
+                else:
+                    if x == 255: self._sb.append(255)
+                    self._state = 3
         return bytes(out)
 
     def read(self, seconds=2, until=None):
@@ -136,16 +175,21 @@ def run_test(host, user, password, serial, operator, threshold=50, duration=6, o
         # Some embedded Telnet servers display "login:" only after a CR/CRLF.
         # Preserve all pre-auth bytes even on failure (V1.0.0 had no evidence).
         login_rx = re.compile(r'(?:login|username|user name)\s*[:：]\s*$', re.I)
-        initial = conn.read(3, lambda s: login_rx.search(s.strip(' \r\n\x00')) is not None)
+        initial = conn.read(2, lambda s: login_rx.search(s.strip(' \r\n\x00')) is not None)
         step(f'Initial RX {len(initial)} chars; hex={initial.encode("latin1", "replace")[:96].hex(" ")}')
         if not login_rx.search(initial.strip(' \r\n\x00')):
             if conn._closed:
                 raise RuntimeError('Telnet 伺服器在登入前關閉連線')
-            step('No login prompt; send CR to wake up server')
-            conn.send('')
-            initial += conn.read(5, lambda s: login_rx.search(s.strip(' \r\n\x00')) is not None)
+            step('No login prompt: initiate Telnet terminal negotiation')
+            conn.negotiate()
+            initial += conn.read(2, lambda s: login_rx.search(s.strip(' \r\n\x00')) is not None)
+            if not login_rx.search(initial.strip(' \r\n\x00')):
+                step('Still no login prompt: send CRLF')
+                conn.send('')
+                initial += conn.read(3, lambda s: login_rx.search(s.strip(' \r\n\x00')) is not None)
         if not login_rx.search(initial.strip(' \r\n\x00')):
             raise RuntimeError('未收到 Login/Username 提示；請查看 LOG 中的 Pre-login Telnet RX 與 negotiation')
+        conn.in_login = False
         conn.send(user)
         prompt = conn.read(8, lambda s: re.search(r'password\s*[:：]', s, re.I) is not None)
         if not re.search(r'password\s*[:：]', prompt, re.I):
@@ -186,7 +230,9 @@ def run_test(host, user, password, serial, operator, threshold=50, duration=6, o
         err = str(e); step('ERROR ' + err)
         if conn: transcript = conn.raw.decode('latin1', 'replace')
     finally:
-        if conn: conn.close()
+        if conn:
+            step(f'Wire RX bytes={len(conn.wire_rx)}, negotiation={len(conn.negotiation)}')
+            conn.close()
     # Keep the password out of saved logs even if remote echoes credentials.
     for secret in (password, 'x4Wnhq2ReL'):
         if secret: transcript = transcript.replace(secret, '[REDACTED]')
@@ -205,7 +251,13 @@ def run_test(host, user, password, serial, operator, threshold=50, duration=6, o
                    host=host, port=int(port), threshold=int(threshold), capture_seconds=float(duration),
                    result=status, rssi_result=rssi_status, sn_result=sn_status, device_sn=device_sn, sn_reason=sn_reason, min_rssi=minimum, reason=reason, samples=samples, events=events,
                    raw_log=base.name + '.log')
-    (base.with_suffix('.log')).write_text('=== Telnet RX (redacted) ===\n' + transcript + '\n\n=== Events ===\n' + '\n'.join(events), encoding='utf-8')
+    diagnostic = ''
+    if conn:
+        diagnostic = ('\n\n=== Telnet diagnostic ===\n'
+                      + 'Raw wire bytes: ' + str(len(conn.wire_rx)) + '\n'
+                      + 'Initial raw wire hex (up to 512 bytes): ' + bytes(conn.prelogin_wire[:512]).hex(' ') + '\n'
+                      + 'Negotiation: ' + '; '.join(conn.negotiation[:100]) + '\n')
+    (base.with_suffix('.log')).write_text('=== Telnet RX (redacted) ===\n' + transcript + diagnostic + '\n=== Events ===\n' + '\n'.join(events), encoding='utf-8')
     (base.with_suffix('.json')).write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding='utf-8')
     ledger = dest / 'RSSI_Test_Results.csv'
     new = not ledger.exists()
